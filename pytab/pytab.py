@@ -18,6 +18,8 @@
 #
 # thomas karlsson relea se
 
+# Todo
+# https://snovvcrash.rocks/2021/05/21/calculating-kerberos-keys.html
 import os
 import base64
 from typing import List, Tuple
@@ -80,25 +82,51 @@ TRANSITED_POLICY_CHECKED = 524288
 OK_AS_DELEGATE = 262144
 
 
+class keytab_principal_entry():
+    def __init__(self):
+        self._realm = str()
+        self.components: List[str] = list()
+        self._configuration_entry = False
+        self.name_type = 0
+
+    def spn(self) -> str:
+        return '/'.join(self.components) + '@' + self.realm
+
+    def name_type_name(self) -> str:
+        if self.name_type in name_types:
+            return name_types[self.name_type]
+
+        return 'unknown-name-type'
+
+    @property
+    def realm(self) -> str:
+        return self._realm
+
+    @realm.setter
+    def realm(self, new_realm: str):
+        self._realm = new_realm
+
+    def export(self) -> bytes:
+        retdata = len(self.components).to_bytes(2, 'big')
+        retdata += len(self.realm).to_bytes(2, 'big')
+        retdata += self.realm.encode()
+        for one_component in self.components:
+            retdata += len(one_component).to_bytes(2, 'big')
+            retdata += one_component.encode()
+        retdata += self.name_type.to_bytes(4, 'big')
+
+        return retdata
+
+
 class keyentry():
     def __init__(self):
-        self._principal: List[str] = []
-        self._realm: str = str()
-        self._name_type: int = 0
+        self.principal = keytab_principal_entry()
         self._timestamp: int = 0
         self._kvno: int = 0
         self._kvno_extended: int = 0
         self._encryption_type: int = 0
         self._key: bytes = b''
         self.deleted: bool = False
-
-    @property
-    def principal(self) -> List[str]:
-        return self._principal
-
-    @principal.setter
-    def principal(self, add_principal: str):
-        self._principal.append(add_principal)
 
     @property
     def name_type(self) -> int:
@@ -172,36 +200,21 @@ class keyentry():
 
     @property
     def spn(self) -> str:
-        return '/'.join(self.principal) + '@' + self.realm
+        return '/'.join(self.principal.components) + '@' + self.realm
 
     def export(self) -> bytes:
         export_data = bytes()
 
-        export_data = export_data + len(self.principal).to_bytes(2, "big")
+        export_data += self.principal.export()
+        export_data += self.timestamp.to_bytes(4, "big")
+        export_data += self.kvno.to_bytes(1, "big")
+        export_data += self.encryption_type.to_bytes(2, "big")
 
-        export_realm = len(self.realm).to_bytes(2, "big")
-        export_realm = export_realm + self.realm.encode()
-        export_data = export_data + export_realm
+        export_data += len(self.key).to_bytes(2, "big")
+        export_data += self.key
 
-        export_principal = bytes()
-        for component in range(len(self.principal)):
-            principal_length = len(self.principal[component]).to_bytes(2, "big")
-            export_principal = export_principal + principal_length + self.principal[component].encode()
-        export_data = export_data + export_principal
-
-        export_data = export_data + self.name_type.to_bytes(4, "big")
-
-        export_data = export_data + self.timestamp.to_bytes(4, "big")
-
-        export_data = export_data + self.kvno.to_bytes(1, "big")
-
-        export_data = export_data + self.encryption_type.to_bytes(2, "big")
-
-        export_data = export_data + len(self.key).to_bytes(2, "big")
-        export_data = export_data + self.key
-
-        if self.kvno_extended:
-            export_data = export_data + self.kvno_extended.to_bytes(4, "big")
+        if self.kvno_extended != 0:
+            export_data += self.kvno_extended.to_bytes(4, "big")
 
         if self.deleted is False:
             export_data = len(export_data).to_bytes(4, "big") + export_data
@@ -217,7 +230,7 @@ class keytab():
         self.magic_header = 5
         self.keytab_version = 0
         self.num_components = 0
-        self.key_entries = list()
+        self.key_entries: List[keyentry] = list()
         self._keytabfile: str = ''
 
     def convert_to_integer(self, value) -> int:
@@ -227,7 +240,7 @@ class keytab():
 
         return value
 
-    def read_str(self, filedata, index, str_length: int = 2):
+    def read_str(self, filedata, index, str_length: int = 2) -> Tuple[int, bytes]:
         length = self.convert_to_integer(filedata[index:index + str_length])
         index += str_length
         retdata = filedata[index:index + length]
@@ -235,26 +248,33 @@ class keytab():
 
         return int(index), retdata
 
-    def read_bytes(self, filedata, index, read_length):
+    def read_bytes(self, filedata, index, read_length) -> Tuple[int, bytes]:
         retdata = filedata[index:index + read_length]
         index += read_length
 
         return index, retdata
 
-    def read_entry(self, key_data):
+    def read_entry(self, key_data, local_index) -> Tuple[int, keyentry]:
         key_record = keyentry()
-        local_index = 0
-        num_components = self.convert_to_integer(key_data[local_index:local_index + 2])
-        local_index += 2
-        local_index, realm = self.read_str(key_data, local_index)
-        key_record.realm = realm.decode()
 
-        for component in range(num_components):
-            local_index, principal = self.read_str(key_data, local_index)
-            key_record.principal = principal.decode()
+        local_index, raw_entry_size = self.read_bytes(key_data, local_index, 4)
+        entry_size = int.from_bytes(raw_entry_size, 'big')
+        start_index = local_index
+
+        principal = keytab_principal_entry()
+        local_index, raw_num_components = self.read_bytes(key_data, local_index, 2)
+        num_components = int.from_bytes(raw_num_components, "big")
+
+        local_index, raw_realm = self.read_str(key_data, local_index)
+        principal.realm = raw_realm.decode()
+
+        for one_component in range(num_components):
+            local_index, component = self.read_str(key_data, local_index)
+            principal.components.append(component.decode())
 
         local_index, name_type = self.read_bytes(key_data, local_index, 4)
-        key_record.name_type = self.convert_to_integer(name_type)
+        principal.name_type = self.convert_to_integer(name_type)
+        key_record.principal = principal
 
         local_index, timestamp = self.read_bytes(key_data, local_index, 4)
         key_record.timestamp = self.convert_to_integer(timestamp)
@@ -265,11 +285,11 @@ class keytab():
         local_index, encryption_type = self.read_bytes(key_data, local_index, 2)
         key_record.encryption_type = self.convert_to_integer(encryption_type)
 
-        local_index, key_length = self.read_bytes(key_data, local_index, 2)
-        converted_key_length = self.convert_to_integer(key_length)
-        local_index, key_content = self.read_bytes(key_data, local_index, converted_key_length)
+        local_index, raw_key_length = self.read_bytes(key_data, local_index, 2)
+        key_length = self.convert_to_integer(raw_key_length)
+        local_index, key_content = self.read_bytes(key_data, local_index, key_length)
         key_record.key = key_content
-        if len(key_data) - local_index >= 4:
+        if local_index - start_index >= 4:
             local_index, extended_kvno = self.read_bytes(key_data, local_index, 4)
             key_record.kvno_extended = self.convert_to_integer(extended_kvno)
             key_record.kvno = key_record.kvno_extended & 0xff
@@ -297,10 +317,7 @@ class keytab():
         index += 1
 
         while index < filesize - 2:
-            record_size = self.convert_to_integer(whole_file[index:index + 4])
-            index += 4
-            add_index, key_entry = self.read_entry(whole_file[index:index + record_size])
-            index += add_index
+            index, key_entry = self.read_entry(whole_file, index)
             self.key_entries.append(key_entry)
 
         return True
@@ -333,13 +350,13 @@ class keytab():
 
     def purge(self, keyid: int):
         if keyid < len(self.entries()):
-            self.key_entries.remove(keyid)
+            del self.key_entries[keyid]
 
     def export(self) -> bytes:
         export_data = b''
         for one_entry in self.entries():
             if one_entry.deleted is False:
-                export_data = export_data + one_entry.export()
+                export_data += one_entry.export()
 
         return b'\x05\x02' + export_data
 
